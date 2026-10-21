@@ -1,24 +1,272 @@
 
-/* satellite.js: SGP4; Leaflet: geographic projection and layers. */
+/* ========================================
+   IOD2 STARTICAL - ORBITAL TRACKING
+
+   NORAD: 64538
+   Orbital data: local tle.json
+   Propagation: satellite.js / SGP4
+   Map: Leaflet
+
+   IMPORTANT:
+   This JavaScript NEVER requests CelesTrak.
+   GitHub Actions updates tle.json separately.
+   ======================================== */
+
 'use strict';
 
 const $ = id => document.getElementById(id);
 
+
+/* ========================================
+   CONFIGURATION
+   ======================================== */
+
+const NORAD_ID = '64538';
+
+// The JSON file must be next to index.html.
+// This relative URL also works on GitHub Pages.
+const TLE_URL = 'tle.json';
+
+// Last valid TLE saved in this browser.
+const CACHE_KEY = 'iod2-startical-tle-v2';
+
+// Check GitHub Pages every 5 minutes.
+// These requests do NOT go to CelesTrak.
+const JSON_CHECK_INTERVAL = 5 * 60 * 1000;
+
+const REQUEST_TIMEOUT = 12000;
+
+
+/* ========================================
+   GLOBAL VARIABLES
+   ======================================== */
+
 let map, marker, past, future, record, metadata;
+
 let following = true;
 let lastTrack = 0;
 
+let tleMode = 'none';
+let tleWarning = '';
+let requestInProgress = false;
+
+
+/* ========================================
+   STATUS
+   ======================================== */
 
 function status(message) {
   $('status').textContent = message;
 }
 
 
-function positionAt(date) {
-  const result = satellite.propagate(record, date);
+/* ========================================
+   LOCAL STORAGE
+   ======================================== */
 
-  if (!result || !result.position || !result.velocity || record.error) {
-    throw new Error('Unable to propagate this TLE.');
+function readStorage(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch (error) {
+    console.warn('Storage unavailable:', error);
+    return null;
+  }
+}
+
+
+function writeStorage(key, value) {
+  try {
+    localStorage.setItem(key, value);
+    return true;
+  } catch (error) {
+    console.warn('Unable to save data:', error);
+    return false;
+  }
+}
+
+
+/* ========================================
+   TLE VALIDATION
+   ======================================== */
+
+function validateTle(line1, line2) {
+  if (
+    typeof line1 !== 'string' ||
+    typeof line2 !== 'string' ||
+    !line1.startsWith('1 ') ||
+    !line2.startsWith('2 ') ||
+    line1.length < 69 ||
+    line2.length < 69 ||
+    line1.slice(2, 7) !== NORAD_ID ||
+    line2.slice(2, 7) !== NORAD_ID
+  ) {
+    throw new Error('Invalid IOD2 TLE.');
+  }
+
+  const candidate = satellite.twoline2satrec(
+    line1,
+    line2
+  );
+
+  if (
+    candidate.error ||
+    !Number.isFinite(candidate.jdsatepoch) ||
+    !Number.isFinite(candidate.no) ||
+    candidate.no <= 0
+  ) {
+    throw new Error('Invalid orbital elements.');
+  }
+
+  return candidate;
+}
+
+
+/* ========================================
+   TLE CACHE
+   ======================================== */
+
+function saveTle(data) {
+  writeStorage(
+    CACHE_KEY,
+    JSON.stringify(data)
+  );
+}
+
+
+function getCachedTle() {
+  try {
+    const saved = readStorage(CACHE_KEY);
+
+    if (!saved) return null;
+
+    const data = JSON.parse(saved);
+
+    validateTle(
+      data.tle_line1,
+      data.tle_line2
+    );
+
+    return data;
+
+  } catch (error) {
+    console.warn('Invalid cached TLE:', error);
+    return null;
+  }
+}
+
+
+/* ========================================
+   LOAD JSON FROM GITHUB PAGES
+   ======================================== */
+
+async function fetchTleJson() {
+  const response = await fetch(TLE_URL, {
+    cache: 'no-store',
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT)
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      'TLE file unavailable (' +
+      response.status +
+      ').'
+    );
+  }
+
+  const data = await response.json();
+
+  if (
+    !data ||
+    typeof data !== 'object'
+  ) {
+    throw new Error('Invalid TLE JSON.');
+  }
+
+  validateTle(
+    data.tle_line1,
+    data.tle_line2
+  );
+
+  return data;
+}
+
+
+/* ========================================
+   APPLY TLE
+   ======================================== */
+
+function applyTle(data, mode) {
+  const candidate = validateTle(
+    data.tle_line1,
+    data.tle_line2
+  );
+
+  record = candidate;
+  metadata = data;
+  tleMode = mode;
+  lastTrack = 0;
+
+  const name = String(
+    data.satellite || 'IOD2'
+  );
+
+  $('sat-name').firstChild.textContent =
+    name + ' ';
+
+  const tooltip = document.createElement('span');
+  tooltip.textContent = name;
+
+  marker.setTooltipContent(tooltip).addTo(map);
+
+  const epoch = new Date(
+    (record.jdsatepoch - 2440587.5) * 86400000
+  ).toISOString();
+
+  const updated = data.last_update
+    ? new Date(data.last_update)
+    : null;
+
+  $('tle-info').textContent =
+    'Estimated position every second' +
+    ' · TLE epoch: ' +
+    epoch.slice(0, 19).replace('T', ' ') +
+    ' UTC' +
+    ' · Source: ' +
+    (data.source || 'CelesTrak') +
+    (
+      updated && Number.isFinite(updated.getTime())
+        ? ' · File updated: ' +
+          updated.toISOString()
+            .slice(0, 19)
+            .replace('T', ' ') +
+          ' UTC'
+        : ''
+    ) +
+    '. This is not telemetry received from the satellite.';
+
+  tick();
+}
+
+
+/* ========================================
+   ORBITAL POSITION
+   ======================================== */
+
+function positionAt(date) {
+  const result = satellite.propagate(
+    record,
+    date
+  );
+
+  if (
+    !result ||
+    !result.position ||
+    !result.velocity ||
+    record.error
+  ) {
+    throw new Error(
+      'Unable to propagate this TLE.'
+    );
   }
 
   const geo = satellite.eciToGeodetic(
@@ -37,29 +285,43 @@ function positionAt(date) {
     )
   };
 
-  if (!Object.values(p).every(Number.isFinite) || p.alt < 0) {
-    throw new Error('Invalid orbital position.');
+  if (
+    !Object.values(p).every(Number.isFinite) ||
+    p.alt < 0
+  ) {
+    throw new Error(
+      'Invalid orbital position.'
+    );
   }
 
   return p;
 }
 
 
-/* Splits segments when crossing ±180°, preventing
-   lines from crossing the entire map. */
+/* ========================================
+   ORBITAL TRAJECTORY
+   ======================================== */
 
 function trajectory(now, start, end) {
   const segments = [];
   let segment = [];
 
-  for (let minute = start; minute <= end; minute++) {
+  for (
+    let minute = start;
+    minute <= end;
+    minute++
+  ) {
     const p = positionAt(
-      new Date(now.getTime() + minute * 60000)
+      new Date(
+        now.getTime() + minute * 60000
+      )
     );
 
     if (
       segment.length &&
-      Math.abs(p.lon - segment[segment.length - 1][1]) > 180
+      Math.abs(
+        p.lon - segment[segment.length - 1][1]
+      ) > 180
     ) {
       segments.push(segment);
       segment = [];
@@ -76,6 +338,10 @@ function trajectory(now, start, end) {
 }
 
 
+/* ========================================
+   POSITION UPDATE
+   ======================================== */
+
 function tick() {
   if (!record) return;
 
@@ -84,7 +350,10 @@ function tick() {
     const p = positionAt(now);
 
     $('utc').textContent =
-      now.toISOString().slice(0, 19).replace('T', ' ') + ' UTC';
+      now.toISOString()
+        .slice(0, 19)
+        .replace('T', ' ') +
+      ' UTC';
 
     $('lat').textContent =
       Math.abs(p.lat).toFixed(2) + '° ' +
@@ -94,9 +363,11 @@ function tick() {
       Math.abs(p.lon).toFixed(2) + '° ' +
       (p.lon >= 0 ? 'E' : 'O');
 
-    $('alt').textContent = p.alt.toFixed(1) + ' km';
+    $('alt').textContent =
+      p.alt.toFixed(1) + ' km';
 
-    $('speed').textContent = p.speed.toFixed(2) + ' km/s';
+    $('speed').textContent =
+      p.speed.toFixed(2) + ' km/s';
 
     if (following) {
       map.setView(
@@ -108,32 +379,43 @@ function tick() {
 
     marker.setLatLng([p.lat, p.lon]);
 
-    if (now.getTime() - lastTrack > 60000) {
-      past.setLatLngs(trajectory(now, -45, 0));
-      future.setLatLngs(trajectory(now, 0, 90));
+    if (
+      now.getTime() - lastTrack > 60000
+    ) {
+      past.setLatLngs(
+        trajectory(now, -45, 0)
+      );
+
+      future.setLatLngs(
+        trajectory(now, 0, 90)
+      );
+
       lastTrack = now.getTime();
     }
 
     const age =
-      (now.getTime() -
+      (
+        now.getTime() -
         (record.jdsatepoch - 2440587.5) * 86400000
       ) / 86400000;
 
-    let message =
-      metadata.mode === 'example'
-        ? 'EXAMPLE · API not configured'
-        : 'TLE received from the API';
+    let message = tleMode === 'published'
+      ? 'IOD2 · TLE loaded from GitHub Pages'
+      : 'IOD2 · Using cached TLE';
 
     if (age > 3) {
-      message += ' · Old TLE: ' + age.toFixed(1) + ' days';
+      message +=
+        ' · Old TLE: ' +
+        age.toFixed(1) +
+        ' days';
     }
 
     if (age < 0) {
       message += ' · Future TLE epoch';
     }
 
-    if (metadata.error) {
-      message += ' · The source reports an error';
+    if (tleWarning) {
+      message += ' · ' + tleWarning;
     }
 
     status(message);
@@ -145,7 +427,14 @@ function tick() {
     past.setLatLngs([]);
     future.setLatLngs([]);
 
-    for (const id of ['lat', 'lon', 'alt', 'speed']) {
+    for (
+      const id of [
+        'lat',
+        'lon',
+        'alt',
+        'speed'
+      ]
+    ) {
       $(id).textContent = '—';
     }
 
@@ -154,109 +443,103 @@ function tick() {
 }
 
 
+/* ========================================
+   LOAD TLE WITH FALLBACK
+
+   Reads ONLY tle.json from GitHub Pages.
+   Never contacts CelesTrak.
+   ======================================== */
+
 async function loadTle() {
+  if (requestInProgress) return;
+
+  requestInProgress = true;
   $('refresh').disabled = true;
-  status('Fetching TLE…');
+
+  if (!record) {
+    status('Loading IOD2 orbital data…');
+  }
 
   try {
-    const response = await fetch('/api/tle', {
-      cache: 'no-store',
-      signal: AbortSignal.timeout(12000)
-    });
+    const data = await fetchTleJson();
 
-    if (!response.ok) {
-      throw new Error(
-        'API unavailable (' + response.status + ').'
-      );
+    // Avoid recalculating everything when
+    // the published TLE has not changed.
+
+    const sameTle =
+      record &&
+      metadata &&
+      metadata.tle_line1 === data.tle_line1 &&
+      metadata.tle_line2 === data.tle_line2;
+
+    if (!sameTle) {
+      applyTle(data, 'published');
+    } else {
+      metadata = data;
+      tleMode = 'published';
     }
 
-    const data = await response.json();
+    saveTle(data);
 
-    if (
-      typeof data.tle_line1 !== 'string' ||
-      typeof data.tle_line2 !== 'string' ||
-      !data.tle_line1.startsWith('1 ') ||
-      !data.tle_line2.startsWith('2 ') ||
-      data.tle_line1.length < 69 ||
-      data.tle_line2.length < 69 ||
-      data.tle_line1.slice(2, 7) !==
-        data.tle_line2.slice(2, 7)
-    ) {
-      throw new Error('Invalid TLE response.');
-    }
-
-    const candidate = satellite.twoline2satrec(
-      data.tle_line1,
-      data.tle_line2
-    );
-
-    if (
-      candidate.error ||
-      !Number.isFinite(candidate.jdsatepoch) ||
-      !Number.isFinite(candidate.no) ||
-      candidate.no <= 0
-    ) {
-      throw new Error('Invalid orbital elements.');
-    }
-
-    record = candidate;
-    metadata = data;
-    lastTrack = 0;
-
-    $('sat-name').firstChild.textContent =
-      String(data.satellite || 'IOD2') + ' ';
-
-    const tooltip = document.createElement('span');
-    tooltip.textContent = String(data.satellite || 'IOD2');
-
-    marker.setTooltipContent(tooltip).addTo(map);
-
-    const epoch = new Date(
-      (record.jdsatepoch - 2440587.5) * 86400000
-    ).toISOString();
-
-    const updated = data.last_update
-      ? new Date(data.last_update)
-      : null;
-
-    $('tle-info').textContent =
-      'Estimated position every second · TLE epoch: ' +
-      epoch.slice(0, 19).replace('T', ' ') +
-      ' UTC · Source: ' +
-      (data.source || 'API') +
-      (
-        updated && Number.isFinite(updated.getTime())
-          ? ' · Source update: ' +
-            updated.toISOString()
-              .slice(0, 19)
-              .replace('T', ' ') +
-            ' UTC'
-          : ''
-      ) +
-      '. This is not telemetry received from the satellite.';
-
+    tleWarning = '';
     tick();
 
   } catch (error) {
-    record = null;
-
-    marker.remove();
-    past.setLatLngs([]);
-    future.setLatLngs([]);
-
-    for (const id of ['lat', 'lon', 'alt', 'speed']) {
-      $(id).textContent = '—';
-    }
-
-    status(
-      error.message + ' Click Refresh TLE to try again.'
+    console.warn(
+      'Unable to load tle.json:',
+      error
     );
 
+    tleWarning =
+      'Published TLE unavailable';
+
+    // Continue using the TLE in memory.
+
+    if (record) {
+      tleMode = 'cached';
+      tick();
+
+    } else {
+      // Try the last valid TLE
+      // saved in this browser.
+
+      const cached = getCachedTle();
+
+      if (cached) {
+        try {
+          applyTle(cached, 'cached');
+          tick();
+
+        } catch (cacheError) {
+          console.error(
+            'Unable to restore cached TLE:',
+            cacheError
+          );
+
+          status(
+            'No valid orbital data available.'
+          );
+        }
+
+      } else {
+        status(
+          'TLE unavailable · ' +
+          'No cached orbital data. ' +
+          'Try again later.'
+        );
+      }
+    }
+
   } finally {
+    requestInProgress = false;
     $('refresh').disabled = false;
   }
 }
 
+
+/* ========================================
+   FOLLOW SATELLITE
+   ======================================== */
 
 function setFollowing(value) {
   following = value;
@@ -279,18 +562,13 @@ function setFollowing(value) {
 if (!window.L || !window.satellite) {
   status(
     'The map libraries could not be loaded. ' +
-    'Check that the public/vendor folder is complete.'
+    'Check the vendor folder.'
   );
 
   $('refresh').disabled = true;
   $('follow').disabled = true;
 
 } else {
-
-  // Flat SVG map in the visual style of index2;
-  // no remote tile service.
-  // This artwork is illustrative,
-  // not a geographic basemap.
 
   const worldBounds = L.latLngBounds([
     [-90, -180],
@@ -307,24 +585,32 @@ if (!window.L || !window.satellite) {
     maxBoundsViscosity: 1
   });
 
-  map.getContainer().style.background = '#080f19';
+  map.getContainer().style.background =
+    '#080f19';
 
   map.fitBounds(worldBounds);
+
   map.fitBounds(worldBounds, {
     padding: [0, 0]
   });
 
-  // La vista inicial será el máximo
-  // alejamiento permitido.
+  // Initial view is the maximum
+  // permitted zoom-out level.
 
   map.setMinZoom(map.getZoom());
+
+
+  /* ========================================
+     ILLUSTRATED BACKGROUND
+     ======================================== */
 
   const background = L.imageOverlay(
     'assets/orbital-map.svg',
     worldBounds,
     {
       interactive: false,
-      attribution: 'Illustrative map · not for navigation'
+      attribution:
+        'Illustrative map · not for navigation'
     }
   ).addTo(map);
 
@@ -335,12 +621,16 @@ if (!window.L || !window.satellite) {
     );
   });
 
-  // Satellite marker
+
+  /* ========================================
+     SATELLITE MARKER
+     ======================================== */
 
   marker = L.marker([0, 0], {
     icon: L.divIcon({
       className: '',
-      html: '<div class="satellite-marker"></div>',
+      html:
+        '<div class="satellite-marker"></div>',
       iconSize: [22, 22],
       iconAnchor: [11, 11]
     })
@@ -350,7 +640,10 @@ if (!window.L || !window.satellite) {
     offset: [0, -14]
   });
 
-  // Past and future orbital trajectories
+
+  /* ========================================
+     ORBITAL TRAJECTORIES
+     ======================================== */
 
   past = L.polyline([], {
     color: '#577b88',
@@ -363,7 +656,10 @@ if (!window.L || !window.satellite) {
     dashArray: '6 7'
   }).addTo(map);
 
-  // Map interactions
+
+  /* ========================================
+     MAP INTERACTIONS
+     ======================================== */
 
   map.on('dragstart', () => {
     setFollowing(false);
@@ -374,12 +670,50 @@ if (!window.L || !window.satellite) {
     tick();
   });
 
-  $('refresh').addEventListener('click', loadTle);
+  // Manual refresh reads only tle.json.
 
-  // Initial load and automatic updates
+  $('refresh').addEventListener(
+    'click',
+    loadTle
+  );
+
+
+  /* ========================================
+     RESTORE CACHE IMMEDIATELY
+     ======================================== */
+
+  const cached = getCachedTle();
+
+  if (cached) {
+    try {
+      applyTle(cached, 'cached');
+
+    } catch (error) {
+      console.warn(
+        'Unable to initialize cached TLE:',
+        error
+      );
+    }
+  }
+
+
+  /* ========================================
+     AUTOMATIC UPDATES
+     ======================================== */
+
+  // Load the shared TLE from GitHub Pages.
 
   loadTle();
 
+  // Update position every second.
+
   setInterval(tick, 1000);
-  setInterval(loadTle, 300000);
+
+  // Recheck GitHub Pages every 5 minutes.
+  // This NEVER requests CelesTrak.
+
+  setInterval(
+    loadTle,
+    JSON_CHECK_INTERVAL
+  );
 }
